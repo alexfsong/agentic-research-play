@@ -1,0 +1,38 @@
+{
+  "_comment": "Default topic seeds + news feed map. Committed alongside the routines; loaded by each routine when no topic is supplied at /fire time.",
+  "arxiv": {
+    "default_topics": [
+      "retrieval augmented generation",
+      "graph neural networks retrieval",
+      "language model agents",
+      "evaluation benchmarks NLP",
+      "reinforcement learning from human feedback"
+    ],
+    "categories": ["cs.CL", "cs.IR", "cs.LG", "cs.AI"]
+  },
+  "news": {
+    "default_topics": ["LLM agents", "RAG evaluation", "open source LLMs"],
+    "topic_feeds": {
+      "LLM agents": [
+        "https://thesequence.substack.com/feed",
+        "https://simonwillison.net/atom/everything/",
+        "https://www.latent.space/feed"
+      ],
+      "RAG evaluation": [
+        "https://blog.langchain.dev/rss/",
+        "https://www.llamaindex.ai/blog/rss.xml"
+      ],
+      "open source LLMs": [
+        "https://huggingface.co/blog/feed.xml",
+        "https://news.ycombinator.com/rss"
+      ]
+    },
+    "general_feeds": [
+      "https://simonwillison.net/atom/everything/",
+      "https://thesequence.substack.com/feed"
+    ]
+  },
+  "adhoc": {
+    "_note": "ingest-url takes URLs directly; no seeds needed."
+  }
+}

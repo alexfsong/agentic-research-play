@@ -1,13 +1,14 @@
 ---
 name: ingest-ask
-description: Local-subscription fallback for the PWA "Ask" tab. Mirror of the cloud `ingest-ask` routine. Given a JSON blob with question + run_id, run a web search, fetch the top results as Markdown, POST each to /ingest tagged source=ask_fill, then POST a final summary to /ask_callback. Invoked headlessly via `claude -p "/ingest-ask <json>"` on the Hetzner VPS when the cloud routine pool is exhausted. Stateless on the corpus side (dedupes on normalized URL).
+description: Local-subscription fallback for the PWA "Ask" tab. Mirror of the cloud `ingest-ask` routine. Given a JSON blob with question + run_id, run a web search, fetch the top results as Markdown, POST each to /ingest tagged source=ask_fill, draft a cited Markdown answer from those bodies, then POST result + answer to /ask_callback. Invoked headlessly via `claude -p "/ingest-ask <json>"` on the Hetzner VPS when the cloud routine pool is exhausted. Stateless on the corpus side (dedupes on normalized URL).
 ---
 
 You are running `/ingest-ask`. Cloud-routine fallback under the user's Claude
 Pro/Max subscription. Identical contract to `routines/ingest-ask.md` — same
-`/ingest` payload, same `/ask_callback` callback. The only difference is who
-runs the WebSearch + WebFetch (you, locally) and the `route` field in the
-callback (`local` instead of `cloud`).
+`/ingest` payload, same `/ask_callback` callback (including `answer_md` +
+`citations`). The only difference is who runs the WebSearch + WebFetch +
+answer drafting (you, locally) and the `route` field in the callback (`local`
+instead of `cloud`).
 
 ## Arguments
 
@@ -83,7 +84,30 @@ Payload:
 Retry 1s/2s/4s on 429/5xx, then bail that URL. Track per-URL outcomes in
 `ingested`, `skipped`, `errors` arrays.
 
-### 5. Callback
+### 5. Draft cited answer
+
+From the markdown bodies you fetched in step 3, draft a Markdown answer to
+`QUESTION`. The webhook stores this verbatim — what you write here is what
+the user sees in the PWA. No server-side LLM rewrite.
+
+- **Source set**: only successfully-fetched URLs from this run (the
+  `ingested` array). No skipped/errored URLs. No model-prior facts. No
+  remembered URLs.
+- **Length**: 150–400 words. Tight. No "based on the sources" preamble.
+- **Citations**: bracketed numeric footnotes inline, e.g. `Foo [1]. Quux
+  [2][3].` Number = 1-based index into the `citations` array below. Every
+  non-trivial claim cites at least one source. If sources disagree, say so
+  and cite both. If sources don't answer the question, say that — don't
+  fabricate.
+- **Format**: plain Markdown. Headers OK. No HTML.
+- **Citations array**: parallel array, entry `i` corresponds to footnote
+  `[i+1]`. Each entry: `{"n": <1-based>, "title": "<page title>", "url":
+  "<normalized url>"}`.
+
+Skip this step if `QUESTION` is empty (URL-only ingest) or `ingested` is
+empty. In those cases use `answer_md=""` and `citations=[]` in the callback.
+
+### 6. Callback
 
 After the loop (success OR partial failure), POST the aggregate to
 `/ask_callback`. **Always send this.** Without it the PWA polls forever.
@@ -95,19 +119,26 @@ After the loop (success OR partial failure), POST the aggregate to
   "status": "complete",
   "ingested": [...],
   "skipped": [...],
-  "errors": [...]
+  "errors": [...],
+  "answer_md": "Foo [1]. Quux [2][3].\n\n## Caveats\nSources disagree on X [1][2].",
+  "citations": [
+    { "n": 1, "title": "<page title>", "url": "<normalized url>" },
+    { "n": 2, "title": "<page title>", "url": "<normalized url>" },
+    { "n": 3, "title": "<page title>", "url": "<normalized url>" }
+  ]
 }
 ```
 
-On routine-level crash (bad input, search totally failed):
+On routine-level crash (bad input, search totally failed) — empty
+`answer_md` + `citations` is fine:
 
 ```json
-{ "run_id": "<RUN_ID>", "route": "local", "status": "failed", "ingested": [], "skipped": [], "errors": [{"message": "..."}] }
+{ "run_id": "<RUN_ID>", "route": "local", "status": "failed", "ingested": [], "skipped": [], "errors": [{"message": "..."}], "answer_md": "", "citations": [] }
 ```
 
 Callback retry policy: 1s/2s/4s on 429/5xx. Log and exit if all retries fail.
 
-### 6. Emit
+### 7. Emit
 
 Print exactly two lines to stdout, then stop:
 
@@ -122,7 +153,7 @@ No chatter.
 
 - Tools allowed: `WebSearch`, `WebFetch`, `Bash`. Nothing else (no Edit, no Write, no Read of arbitrary paths). The webhook invokes you with `--allowedTools "WebSearch,WebFetch,Bash"`; do not request elevated tools.
 - Use `WebFetch` for content, not `curl`. Reserve `curl` for the `/ingest` and `/ask_callback` POSTs.
-- Do not run synthesis here. Server runs `/synthesize2` after callback.
+- Don't cite sources outside the `ingested` set for this run. No model-prior facts, no remembered URLs.
 - Do not write files outside `/tmp`. Payload temp files go in `mktemp -d`.
 - Do not log the bearer token.
-- If WebSearch returns zero results → callback with `status="complete"`, empty `ingested`, `errors=[{"message":"no search results"}]`. The webhook's synthesis pass will still run against the existing corpus.
+- If WebSearch returns zero results → callback with `status="complete"`, empty `ingested`, `answer_md=""`, `citations=[]`, `errors=[{"message":"no search results"}]`.

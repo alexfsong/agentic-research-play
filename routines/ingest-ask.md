@@ -1,6 +1,6 @@
 ---
 name: ingest-ask
-description: Cloud research+ingest path for the PWA "Ask" tab. Given a user question, run a web search, fetch the top results as Markdown, POST each to /ingest tagged source=ask_fill, then POST a final summary to /ask_callback so the webhook can run /synthesize2 and resolve the PWA's polling loop. Stateless on the corpus side (dedupes on normalized URL).
+description: Cloud research+ingest path for the PWA "Ask" tab. Given a user question, run a web search, fetch the top results as Markdown, POST each to /ingest tagged source=ask_fill, draft a cited Markdown answer from the fetched content, then POST result + answer to /ask_callback. Stateless on the corpus side (dedupes on normalized URL).
 tools: [Bash, WebFetch, WebSearch]
 model: claude-sonnet-4-6
 ---
@@ -8,15 +8,16 @@ model: claude-sonnet-4-6
 # ingest-ask
 
 The cloud-routine half of the new "Ask" pipeline (ODR replacement). Fetches
-fresh material on demand so the subsequent `/synthesize2` call lands against an
-enriched corpus, then notifies the webhook so the PWA can render a cited
-answer.
+fresh material on demand, drafts a cited Markdown answer from that material,
+and posts the answer + per-URL outcomes to the webhook so the PWA can render
+the result. The webhook does **no** server-side LLM synthesis — the answer is
+authored here and persisted verbatim.
 
 This routine is the **cloud quota** path. Mirrored locally as the
-`.claude/skills/ingest-ask.md` skill, which is invoked on the VPS via
+`.claude/commands/ingest-ask.md` slash command, which is invoked on the VPS via
 `claude -p "/ingest-ask <json>"` when the cloud routine pool is exhausted. Both
 paths post to the same webhook contract — the only thing that changes is who
-is running the WebSearch + WebFetch.
+is running the WebSearch + WebFetch + answer drafting.
 
 ## Inputs (from `/fire` payload `text` field)
 
@@ -49,7 +50,8 @@ Read from routine secrets. Fail fast if missing.
    - `WebFetch` asking for Markdown. Extract document title from `<title>` or `<h1>`.
    - Skip with reason `"body < 300 chars"` if too short (paywall / failed fetch / low-content page).
 5. POST each successful fetch to `/ingest`.
-6. After the loop (success OR partial failure), POST the aggregate summary to `/ask_callback` (see below). Send it even on full failure.
+6. **Draft the cited answer** from the fetched markdown bodies (see "Answer drafting" below). Skip if `question` is empty (URL-only ingest) or all fetches failed.
+7. After the loop (success OR partial failure), POST the aggregate summary + answer to `/ask_callback` (see below). Send it even on full failure.
 
 ## /ingest payload
 
@@ -72,11 +74,35 @@ Read from routine secrets. Fail fast if missing.
 
 No `chunk_size` override.
 
+## Answer drafting
+
+After the fetch loop, before the callback, draft a Markdown answer to
+`question` grounded in the fetched bodies. The answer is what the PWA renders
+verbatim — the webhook does no further LLM synthesis.
+
+- **Source set**: only the URLs you successfully fetched in this run (the
+  `ingested` array). Don't cite skipped/errored URLs. Don't cite anything
+  outside the fetched set (no model-prior facts, no remembered URLs).
+- **Length**: 150–400 words. Tight, direct. No "based on the sources" preamble.
+- **Citation style**: bracketed numeric footnotes inline, e.g. `Foo bar [1].
+  Quux baz [2][3].` Number = 1-based index into the `citations` array below.
+- **Coverage**: every non-trivial claim cites at least one source. If sources
+  disagree, say so and cite both. If sources don't answer the question, say
+  that explicitly — don't fabricate.
+- **Format**: plain Markdown. Headers OK. No HTML. No code blocks unless
+  quoting code from a source.
+- **Citations array**: build a parallel array where index `i` corresponds to
+  footnote `[i+1]` in `answer_md`. Each entry: `{"n": <1-based>, "title":
+  "<page title>", "url": "<normalized url>"}`.
+
+Skip drafting if `question` is empty (URL-only ingest) or `ingested` is empty
+after the loop. In those cases send `answer_md: ""` and `citations: []`.
+
 ## /ask_callback payload (final step — REQUIRED)
 
-This is what unblocks the PWA's polling loop. Send it even on full failure. The
-webhook reads the callback, then runs `/synthesize2` against the (now enriched)
-corpus, stores the cited answer in the run state, and PWA's poll picks it up.
+This is what unblocks the PWA's polling loop. Send it even on full failure.
+The webhook stores `answer_md` + `citations` verbatim — what you draft is what
+the user sees.
 
 ```bash
 curl -sS -X POST "$WEBHOOK_URL/ask_callback" \
@@ -98,14 +124,21 @@ curl -sS -X POST "$WEBHOOK_URL/ask_callback" \
   ],
   "errors": [
     { "url": "<normalized>", "status": 500, "message": "..." }
+  ],
+  "answer_md": "Foo bar [1]. Quux baz [2][3].\n\n## Caveats\nSources disagree on X [1][2].",
+  "citations": [
+    { "n": 1, "title": "<page title>", "url": "<normalized url>" },
+    { "n": 2, "title": "<page title>", "url": "<normalized url>" },
+    { "n": 3, "title": "<page title>", "url": "<normalized url>" }
   ]
 }
 ```
 
-If the routine itself crashes early (bad input, search failure), still post:
+If the routine itself crashes early (bad input, search failure), still post —
+empty `answer_md` + `citations` is fine in that case:
 
 ```json
-{ "run_id": "<echoed>", "route": "cloud", "status": "failed", "ingested": [], "skipped": [], "errors": [{"message": "..."}] }
+{ "run_id": "<echoed>", "route": "cloud", "status": "failed", "ingested": [], "skipped": [], "errors": [{"message": "..."}], "answer_md": "", "citations": [] }
 ```
 
 ## Error handling
@@ -116,11 +149,11 @@ If the routine itself crashes early (bad input, search failure), still post:
 ## Tips for the caller (Hetzner webhook `/ask`)
 - Pack inputs as JSON into the `/fire` `text` field. Don't try natural-language phrasing.
 - Mint `run_id` server-side (UUID, prefix `ask_`) before firing.
-- After firing, server stores `{run_id: pending, route: cloud}`. The callback flips it to `complete` (or `failed`) with the result body, then triggers `/synthesize2` server-side.
+- After firing, server stores `{run_id: pending, route: cloud}`. The callback flips it to `complete` (or `failed`) and persists `answer_md` + `citations` verbatim. No further server-side LLM call.
 - On routine pool 429 / quota exhaust → don't fail; spawn the local skill instead (`subprocess claude -p "/ingest-ask <json>"`) and set `route=local` in run state.
 
 ## Don't
 - Don't use this for bulk seeding — that's `ingest-arxiv` / `ingest-news` / `ingest-url`. Keep `ask_fill` reserved for Ask-tab queries so the source tag stays meaningful.
 - Don't widen the search beyond `max_fetches` — the user is waiting on a spinner.
-- Don't run synthesis here. Synthesis happens server-side via `/synthesize2` after callback.
+- Don't cite sources outside the `ingested` set for this run. No model-prior facts, no remembered URLs.
 - Don't skip the callback. Without it the PWA polls forever.

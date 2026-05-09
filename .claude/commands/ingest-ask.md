@@ -23,6 +23,7 @@ THREAD_ID=$(echo "$PAYLOAD" | jq -r '.thread_id // ""')
 MAX=$(echo "$PAYLOAD" | jq -r '.max_fetches // 10')
 TOPIC=$(echo "$PAYLOAD" | jq -r '.topic // ""')
 URLS=$(echo "$PAYLOAD" | jq -r '.urls // [] | .[]')
+HISTORY=$(echo "$PAYLOAD" | jq -c '.history // []')   # JSON array of {q,a}, oldest→newest, may be empty
 ```
 
 If JSON parse fails or `run_id` empty → POST callback with `errors=[{"message":"bad payload"}]` and stop.
@@ -43,7 +44,8 @@ If `QUESTION` empty AND `URLS` empty → POST callback with `errors=[{"message":
 ### 2. Resolve URLs
 
 - If `URLS` non-empty → use verbatim (cap at `MAX`).
-- Else → `WebSearch QUESTION`. Take the top `MAX` result URLs.
+- Else if `HISTORY` non-empty (length > 0) → reformulate `QUESTION` into a self-contained search query (resolve pronouns / "it" / "that" / "the same" against prior turns), then `WebSearch <reformulated>`. Take the top `MAX` result URLs. Example: prior `q="What is FSRS?"`, current `QUESTION="how does it compare to SM-2?"` → search `"FSRS vs SM-2 spaced repetition algorithm"`.
+- Else → `WebSearch QUESTION` verbatim. Take the top `MAX` result URLs.
 
 ### 3. Fetch loop
 
@@ -90,9 +92,14 @@ From the markdown bodies you fetched in step 3, draft a Markdown answer to
 `QUESTION`. The webhook stores this verbatim — what you write here is what
 the user sees in the PWA. No server-side LLM rewrite.
 
+- **Continuation context**: if `HISTORY` is non-empty, treat it as the
+  conversation so far. Resolve anaphora ("it", "that", "the same") against
+  prior turns. Don't repeat what was already said in `HISTORY[*].a` — pick
+  up where it left off. Prior answers are context, not evidence — don't
+  cite them.
 - **Source set**: only successfully-fetched URLs from this run (the
   `ingested` array). No skipped/errored URLs. No model-prior facts. No
-  remembered URLs.
+  remembered URLs. No prior turns.
 - **Length**: 150–400 words. Tight. No "based on the sources" preamble.
 - **Citations**: bracketed numeric footnotes inline, e.g. `Foo [1]. Quux
   [2][3].` Number = 1-based index into the `citations` array below. Every

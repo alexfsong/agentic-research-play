@@ -27,8 +27,9 @@ string. **First step of the routine: parse `text` as JSON** into the fields
 below. If parsing fails, return a callback with `errors=[{"message":"text not JSON"}]` and stop.
 
 - `run_id` (string, **required**) — opaque ID minted by the webhook (`ask_<hex>`). Echoed in the callback.
-- `question` (string, **required**) — the user's question. Used as the web-search query.
+- `question` (string, **required**) — the user's question. Seed for the web-search query (see "Conversation history" if continuation).
 - `thread_id` (string, optional) — ask-thread ID if the question is a continuation. Stored in metadata so the corpus can attribute later.
+- `history` (array, optional) — prior turns in the same thread, oldest→newest, each `{"q": "...", "a": "..."}` (answers truncated by webhook). Use for query reformulation + answer context. Empty for first turn of a thread.
 - `urls` (string[], optional) — skip search, fetch these directly.
 - `max_fetches` (int, optional, default **10**) — cap on results fetched + ingested.
 - `topic` (string, optional) — free-form tag stored in metadata.
@@ -44,7 +45,8 @@ Read from routine secrets. Fail fast if missing.
 2. Validate. If `question` empty AND `urls` empty → POST callback with `errors=[{"message":"question or urls required"}]` and stop.
 3. Resolve the URL list:
    1. If `urls` non-empty → use verbatim (cap at `max_fetches`).
-   2. Else → `WebSearch question`. Take the top `max_fetches` result URLs.
+   2. Else if `history` non-empty → reformulate `question` into a self-contained search query (resolve pronouns / "it" / "that" / "the same" against the prior turns), then `WebSearch <reformulated>`. Take the top `max_fetches` result URLs. Example: prior turn `q="What is FSRS?"`, current `question="how does it compare to SM-2?"` → search `"FSRS vs SM-2 spaced repetition algorithm"`.
+   3. Else → `WebSearch question` verbatim. Take the top `max_fetches` result URLs.
 4. For each URL:
    - Normalize: lowercase host, strip `#fragment`, remove `utm_*` / `fbclid` / `gclid` / `ref` query params.
    - `WebFetch` asking for Markdown. Extract document title from `<title>` or `<h1>`.
@@ -80,9 +82,15 @@ After the fetch loop, before the callback, draft a Markdown answer to
 `question` grounded in the fetched bodies. The answer is what the PWA renders
 verbatim — the webhook does no further LLM synthesis.
 
+- **Continuation context**: if `history` is non-empty, treat it as the
+  conversation so far. Resolve anaphora ("it", "that", "the same") against
+  prior turns. Don't repeat what was already said in `history[*].a` — pick up
+  where it left off. Don't cite prior answers as sources; they're context, not
+  evidence.
 - **Source set**: only the URLs you successfully fetched in this run (the
   `ingested` array). Don't cite skipped/errored URLs. Don't cite anything
-  outside the fetched set (no model-prior facts, no remembered URLs).
+  outside the fetched set (no model-prior facts, no remembered URLs, no prior
+  turns).
 - **Length**: 150–400 words. Tight, direct. No "based on the sources" preamble.
 - **Citation style**: bracketed numeric footnotes inline, e.g. `Foo bar [1].
   Quux baz [2][3].` Number = 1-based index into the `citations` array below.

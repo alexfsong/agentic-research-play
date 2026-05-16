@@ -185,10 +185,10 @@ async def _fire_local_skill(payload: dict, run_id: str,
     timeout_s = int(os.environ.get("CLAUDE_FALLBACK_TIMEOUT", "240"))
     arg = json.dumps(payload)
     cmd = [
-        "sudo", "-u", user, "/usr/bin/claude",
+        "sudo", "-n", "-u", user, os.environ["CLAUDE_BIN"],
         "-p", f"/ingest-ask {arg}",
         "--allowedTools", "WebSearch,WebFetch,Bash",
-        "--permission-mode", "default",
+        "--permission-mode", "bypassPermissions",
     ]
     env = {
         "WEBHOOK_URL": "http://127.0.0.1:8000",
@@ -440,10 +440,14 @@ In the same PR, update INFRA.md:
 >
 > A locked-down `claude-runner` Linux user holds a Claude Code install logged in
 > with a Pro/Max subscription OAT. The webhook invokes it via
-> `sudo -u claude-runner /usr/bin/claude -p ...` (NOPASSWD limited to that
-> single binary) when the cloud routine pool is exhausted. Skill markdown lives
-> at `/home/claude-runner/.claude/skills/`. Rotate the OAT every 90 days
-> (`sudo -i -u claude-runner claude logout` → `claude login`).
+> `sudo -n -u claude-runner /home/claude-runner/.npm-global/bin/claude -p ...`
+> (NOPASSWD limited to that single binary) when the cloud routine pool is
+> exhausted. Slash command lives at `/home/claude-runner/.claude/commands/ingest-ask.md`
+> (NOT `skills/` — `commands/` is the dir Claude Code resolves `/name` against).
+> Sudoers needs `Defaults>claude-runner env_keep += "WEBHOOK_URL WEBHOOK_API_KEY"`
+> or the skill exits with "WEBHOOK_URL not set". Subprocess args:
+> `--allowedTools "WebSearch,WebFetch,Bash" --permission-mode bypassPermissions`.
+> Rotate the OAT every 90 days (`sudo -i -u claude-runner claude logout` → `claude login`).
 
 ### Push
 
@@ -478,37 +482,72 @@ Log in as root via Hetzner Cloud Console or `ssh root@195.201.99.206`:
 ```bash
 adduser --disabled-password --gecos "" claude-runner
 
-# Node + Claude Code (per INFRA.md, install global packages cleanly)
+# Node available on the box (skip apt install if `node -v` already works)
 apt update && apt install -y nodejs npm
+
+# Per-user npm-prefix install (cleaner blast radius than `sudo npm -g`)
+sudo -i -u claude-runner bash <<'INNER'
+mkdir -p ~/.npm-global
+npm config set prefix ~/.npm-global
+echo 'export PATH=$HOME/.npm-global/bin:$PATH' >> ~/.bashrc
+export PATH=$HOME/.npm-global/bin:$PATH
 npm install -g @anthropic-ai/claude-code
+which claude    # → /home/claude-runner/.npm-global/bin/claude
+INNER
 
 # Login as claude-runner once — interactive
 sudo -i -u claude-runner
 claude login    # paste the OAT or use the device-code flow
 exit            # back to root
 
-# Allow researcher to run `claude` only as claude-runner
+# Allow researcher to run `claude` only as claude-runner.
+# env_keep is REQUIRED — without it sudo strips WEBHOOK_URL/WEBHOOK_API_KEY.
 cat > /etc/sudoers.d/claude-runner <<'EOF'
-researcher ALL=(claude-runner) NOPASSWD: /usr/bin/claude
+Defaults>claude-runner env_keep += "WEBHOOK_URL WEBHOOK_API_KEY"
+researcher ALL=(claude-runner) NOPASSWD: /home/claude-runner/.npm-global/bin/claude
 EOF
 chmod 440 /etc/sudoers.d/claude-runner
-visudo -cf /etc/sudoers.d/claude-runner    # syntax check
+chown root:root /etc/sudoers.d/claude-runner
+visudo -c                                  # parses ALL of /etc/sudoers.d/
 
-# Drop the skill into claude-runner's skills dir
-sudo -u claude-runner mkdir -p /home/claude-runner/.claude/skills
-# Paste the contents of agentic-research-play/.claude/skills/ingest-ask.md
-sudo -u claude-runner tee /home/claude-runner/.claude/skills/ingest-ask.md > /dev/null <<'EOF'
-<paste full skill markdown including frontmatter>
+# Drop the slash command into claude-runner's commands dir.
+# NOTE: `commands/`, NOT `skills/` — Claude Code only fires `/name` syntax
+# against ~/.claude/commands/<name>.md. Skills (~/.claude/skills/<name>/SKILL.md)
+# are a different mechanism, auto-loaded by the model rather than invoked
+# explicitly.
+sudo -u claude-runner mkdir -p /home/claude-runner/.claude/commands
+# Paste the contents of agentic-research-play/.claude/commands/ingest-ask.md
+sudo -u claude-runner tee /home/claude-runner/.claude/commands/ingest-ask.md > /dev/null <<'EOF'
+<paste full slash-command markdown including frontmatter>
 EOF
-sudo -u claude-runner chmod 600 /home/claude-runner/.claude/skills/ingest-ask.md
+sudo -u claude-runner chmod 600 /home/claude-runner/.claude/commands/ingest-ask.md
+
+# Add CLAUDE_BIN to /home/researcher/research-webhook/.env (must match sudoers Cmnd byte-for-byte):
+#   CLAUDE_BIN=/home/claude-runner/.npm-global/bin/claude
 ```
 
 Verify (back as `researcher`):
 
 ```bash
-sudo -u claude-runner /usr/bin/claude -p "echo hi" 2>&1 | tail -5
-# Should respond. Sudo should NOT prompt for password.
+# 1. NOPASSWD rule resolves
+sudo -n -u claude-runner /home/claude-runner/.npm-global/bin/claude -p "echo hi" 2>&1 | tail -5
+# 2. Slash command is registered
+sudo -n -u claude-runner /home/claude-runner/.npm-global/bin/claude -p "/help" 2>&1 | grep -i ingest-ask
+# 3. End-to-end (in another shell: `sudo journalctl -u research-webhook -f`)
+KEY=$(sudo grep ^WEBHOOK_API_KEY /home/researcher/research-webhook/.env | cut -d= -f2-)
+sudo -n -u claude-runner \
+  env WEBHOOK_URL=http://127.0.0.1:8000 WEBHOOK_API_KEY="$KEY" \
+  /home/claude-runner/.npm-global/bin/claude \
+  -p '/ingest-ask {"run_id":"smoke1","question":"what is FSRS?","thread_id":"t1","max_fetches":1}' \
+  --allowedTools "WebSearch,WebFetch,Bash" \
+  --permission-mode bypassPermissions
+# Webhook journal should show POST /ingest (200) then POST /ask_callback (200).
 ```
+
+If step 3's POST fails with "WEBHOOK_URL not set" → `env_keep` line missing or
+sudoers not reloaded. If Bash tool calls fail with "exit code 1" → forgot
+`--permission-mode bypassPermissions` (default mode auto-denies tool prompts in
+non-interactive `-p` mode).
 
 ### B2. Migrate the venv (researcher)
 

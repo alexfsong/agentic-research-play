@@ -33,6 +33,8 @@ below. If parsing fails, return a callback with `errors=[{"message":"text not JS
 - `urls` (string[], optional) — skip search, fetch these directly.
 - `max_fetches` (int, optional, default **10**) — cap on results fetched + ingested.
 - `topic` (string, optional) — free-form tag stored in metadata.
+- `depth` (string, optional, default `"standard"`) — tier selector. `standard` = full single-pass pipeline (search + fetch + ingest + draft answer + callback). `deep` = **search + fetch + ingest only**; the webhook orchestrates synthesis and the final report. Do not draft an answer when `depth=deep`.
+- `budget` (object, optional) — per-tier caps `{max_searches, max_fetches, max_tokens, max_iterations}`. Honor `max_fetches` if present (overrides the top-level `max_fetches` field). The other budgets are advisory for the routine; the orchestrator enforces iteration/token caps.
 
 ## Environment
 - `WEBHOOK_URL`, `WEBHOOK_API_KEY`.
@@ -41,7 +43,7 @@ Read from routine secrets. Fail fast if missing.
 
 ## Algorithm
 
-1. Parse `text` as JSON. Extract fields above.
+1. Parse `text` as JSON. Extract fields above. Default `depth` to `"standard"` if missing.
 2. Validate. If `question` empty AND `urls` empty → POST callback with `errors=[{"message":"question or urls required"}]` and stop.
 3. Resolve the URL list:
    1. If `urls` non-empty → use verbatim (cap at `max_fetches`).
@@ -52,8 +54,10 @@ Read from routine secrets. Fail fast if missing.
    - `WebFetch` asking for Markdown. Extract document title from `<title>` or `<h1>`.
    - Skip with reason `"body < 300 chars"` if too short (paywall / failed fetch / low-content page).
 5. POST each successful fetch to `/ingest`.
-6. **Draft the cited answer** from the fetched markdown bodies (see "Answer drafting" below). Skip if `question` is empty (URL-only ingest) or all fetches failed.
-7. After the loop (success OR partial failure), POST the aggregate summary + answer to `/ask_callback` (see below). Send it even on full failure.
+6. **Branch on `depth`:**
+   - `depth="standard"` (default) → draft the cited Markdown answer from the fetched bodies (see "Answer drafting" below). Skip if `question` is empty or all fetches failed.
+   - `depth="deep"` → **skip answer drafting**. The webhook orchestrator runs the multi-round synthesizer and assembles the final sectioned report. Your job is corpus-growth only.
+7. After the loop (success OR partial failure), POST the aggregate summary to `/ask_callback`. Send it even on full failure. For `depth=deep`, send empty `answer_md` + `citations` (the orchestrator will replace those with the final report).
 
 ## /ingest payload
 

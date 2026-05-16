@@ -10,7 +10,8 @@ Current Ask flow is a single fast pass: one WebSearch round, fetch top hits, one
 - Thread `depth` end-to-end: PWA → `POST /ask` → routine fire URL query param → `ingest-ask` routine + local skill prompts → `/ask_callback` payload.
 - Persist `depth` on the `ask_turns` row (new column) so threads can be re-rendered with the depth that produced them.
 - Per-depth budgets (env-tunable): `ASK_DEPTH_<TIER>_MAX_SEARCHES`, `_MAX_FETCHES`, `_MAX_TOKENS`, `_MAX_ITERATIONS`.
-- Concurrency: `deep` runs on its own per-bearer slot (cap 1 deep-in-flight per bearer) so a user's deep turn doesn't block their own standard turns or other users' work.
+- Concurrency: `deep` runs serially **per bearer** behind a FIFO queue (one in-flight per bearer, additional submissions enqueue with visible position/ETA in the PWA) so a user can stack research questions overnight without blocking standard turns or other users' work.
+- Auth: deep synthesis runs through a `claude -p` subprocess (`/deep-synth` local skill) so per-round LLM cost charges against the operator's Claude Pro/Max subscription quota, not `ANTHROPIC_API_KEY`. The orchestrator still owns the loop, dedup, retrieval, citation snapshot, and callback in Python.
 
 ## Capabilities
 
@@ -30,4 +31,5 @@ Current Ask flow is a single fast pass: one WebSearch round, fetch top hits, one
 - **PWA**: Ask tab gets depth control; Threads/turn renderer handles both `answer` (flat) and `report` (sectioned) shapes.
 - **Cost**: `deep` materially raises per-turn Anthropic + web-fetch spend. Gate behind explicit user choice; surface estimated tier cost in UI.
 - **Concurrency**: `deep` may run longer than the current `concurrency=1` rate-limit assumes — separate slot or queue for deep turns to avoid blocking fast/standard.
+- **Queue**: persisted SQLite queue (`ask_deep_queue`) so a webhook restart resumes pending work instead of dropping it. Per-bearer drainer task spawned at startup + on enqueue; global cap on concurrent drainers keeps subprocess fan-out bounded.
 - **Touches**: `[[anthropic_auth_split]]` (deep loop still uses ANTHROPIC_API_KEY for direct SDK calls), `[[ask_pivot_architecture]]` (extends, doesn't replace), `[[course_layer_architecture]]` (no overlap).

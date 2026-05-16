@@ -35,7 +35,7 @@ phone PWA / curl ──HTTPS──▶ Caddy (lisearch.195-201-99-206.sslip.io)
                                        ├─▶ Anthropic /fire API ──▶ ingest-ask cloud routine
                                        │                              └ WebSearch + WebFetch + POST /ingest
                                        │
-                                       └─▶ sudo -u claude-runner /usr/bin/claude -p "/ingest-ask <json>"
+                                       └─▶ sudo -n -u claude-runner ~/.npm-global/bin/claude -p "/ingest-ask <json>"
                                               (Pro/Max subscription OAT, fallback when routine pool full)
                                               └ same WebSearch + WebFetch + POST /ingest
 ```
@@ -68,7 +68,7 @@ All paths on the VPS under user `researcher` unless noted. The repo root is `/ho
 | `/etc/systemd/system/research-webhook.service` | Systemd unit. |
 | `/etc/caddy/Caddyfile` | Caddy global config; per-app block in `~/research-webhook/deploy/Caddyfile.snippet`. |
 | `/home/claude-runner/.claude/` | OAT-authed Claude Code install (subscription fallback runner). |
-| `/home/claude-runner/.claude/skills/ingest-ask.md` | Mirror of the cloud routine, run via `claude -p`. |
+| `/home/claude-runner/.claude/commands/ingest-ask.md` | Mirror of the cloud routine, run via `claude -p "/ingest-ask <json>"`. |
 
 ## Services
 
@@ -184,8 +184,9 @@ Webhook env vars live in `/home/researcher/research-webhook/.env` (loaded by sys
 
 - Port 8000 binds `127.0.0.1` only. Caddy fronts HTTPS on `:443`; ufw allows 22/80/443 only.
 - Bearer-token auth on every API path.
-- `claude-runner` Linux user has no sudo, no shell login, no docker. Webhook reaches it only via `sudo -u claude-runner /usr/bin/claude -p ...` (NOPASSWD limited to that single binary).
-- Subprocess invoked with `--allowedTools "WebSearch,WebFetch,Bash"` — no Edit/Write/Read of arbitrary files.
+- `claude-runner` Linux user has no sudo, no shell login, no docker. Webhook reaches it only via `sudo -n -u claude-runner /home/claude-runner/.npm-global/bin/claude -p ...` (NOPASSWD limited to that single binary).
+- Subprocess invoked with `--allowedTools "WebSearch,WebFetch,Bash"` and `--permission-mode bypassPermissions`. The `--allowedTools` whitelist is the real safety boundary (no Edit/Write/Read of arbitrary files); `bypassPermissions` is required because non-interactive `-p` mode otherwise auto-denies tool prompts.
+- Sudoers `Defaults>claude-runner env_keep += "WEBHOOK_URL WEBHOOK_API_KEY"` — only those two vars are passed through; everything else is stripped by sudo's `env_reset`.
 - `.env` files chmod 600. Subscription OAT in `~claude-runner/.claude/.credentials.json` chmod 600. Rotate every 90 days.
 - One-line audit log at `~/research-data/ask-audit.log` (run_id, route, question prefix, timestamp).
 - Never paste `.env` contents into chats / logs / PRs (per `INFRA.md`'s hard rules). Rotate immediately if it happens.
@@ -200,7 +201,7 @@ This repo is the source of truth for the routine + skill markdown.
 - `ingest-research.md` — lesson gap-fill (existing). Reads `{run_id, question, lesson_id, course_id, urls, max_fetches, topic}`, fires `/ingest` with `source=research_fill`, callbacks to `/research_callback`.
 - `ingest-arxiv.md`, `ingest-news.md`, `ingest-url.md` — bulk seed routines. Schedule via the workspace UI's cron.
 
-**Local skill** (`.claude/skills/ingest-ask.md`): mirrors `ingest-ask.md`. Drop into `/home/claude-runner/.claude/skills/`. Webhook invokes via `subprocess sudo -u claude-runner /usr/bin/claude -p "/ingest-ask <json>"`. Same payload contract; only the `route` field in the callback differs (`local` vs `cloud`).
+**Local slash command** (`.claude/commands/ingest-ask.md`): mirrors `routines/ingest-ask.md`. Drop into `/home/claude-runner/.claude/commands/` (NOT `skills/` — Claude Code only fires `/name` syntax against `commands/<name>.md`; skills are auto-loaded by the model rather than invoked explicitly). Webhook invokes via `subprocess sudo -n -u claude-runner /home/claude-runner/.npm-global/bin/claude -p "/ingest-ask <json>" --allowedTools "WebSearch,WebFetch,Bash" --permission-mode bypassPermissions`. Same payload contract; only the `route` field in the callback differs (`local` vs `cloud`).
 
 When extending the Ask flow, change both the routine and the skill in lockstep — they share the `/ask_callback` shape.
 

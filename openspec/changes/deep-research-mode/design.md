@@ -52,10 +52,17 @@ Constraints:
 - **Rationale:** Halves per-round LLM cost. The model already has the partial state in context, asking it to also enumerate gaps is cheap; cleanly separating the steps would re-pay context tokens.
 - **Alternative:** Separate gap call. Rejected — independently tunable but ~2× cost for marginal quality gain. If gap quality regresses, can split later without API changes.
 
-### Decision: Deep concurrency = 1 in-flight per bearer, dedicated routine slot
-- **Choice:** Per-bearer counter in webhook tracks in-flight deep runs; second deep submission from same bearer returns 429. Deep runs go through `ROUTINE_ASK_DEEP_FIRE_URL` (separate from `ROUTINE_ASK_FIRE_URL` used by standard) so deep work doesn't sit in the standard concurrency=1 queue.
-- **Rationale:** Multi-user fairness without serializing across users. Same-bearer cap prevents one user firing many parallel deep runs and blowing budget.
-- **Alternative A:** 1 globally. Rejected — second user always waits. **Alternative B:** unlimited per bearer. Rejected — invites per-user cost runaway.
+### Decision: Per-bearer FIFO queue + serial drainer, persisted in SQLite
+- **Choice:** `ask_deep_queue(run_id, bearer, payload_json, status, enqueued_at, started_at, finished_at)` SQLite table. Submitting deep enqueues with status='queued'. A per-bearer asyncio drainer pops the oldest queued row, flips it to 'running', invokes `deep_research.run_deep`, then on callback flips to 'done'. The webhook spawns one drainer per bearer-with-queued-work at startup and on enqueue. Daily cap (`ASK_DEPTH_DEEP_MAX_PER_DAY`) is enforced at enqueue time on rows submitted today (any status). Global cap (`ASK_DEPTH_DEEP_MAX_DRAINERS`) bounds total concurrent deep subprocesses across all bearers.
+- **Rationale:** Subscription quota is best amortized over time — letting a user stack questions overnight is the whole point. Persisting the queue means a webhook restart doesn't drop pending work. Per-bearer drainers preserve multi-user fairness; the global cap keeps subprocess fan-out bounded.
+- **PWA UX:** `/ask_runs/{run_id}` returns `status='queued'` with `queue_position` (# queued ahead of this run for the same bearer) and `queue_total` (total queued for the bearer). PWA renders "queued · position N" until the drainer picks it up.
+- **Alternatives rejected:** 429 on second deep — wastes idle subscription quota and forces the user to babysit submissions. In-memory queue — loses pending work on restart. One global drainer — second user always waits.
+
+### Decision: Deep synthesis runs through `claude -p` subprocess (subscription path)
+- **Choice:** Each round of `deep_research.run_deep` invokes `claude -p "/deep-synth <json>"` as a subprocess (same `CLAUDE_FALLBACK_USER` plumbing as the local-skill ingest fallback) instead of `anthropic.AsyncAnthropic().messages.create(...)`. The `/deep-synth` local skill receives `{question, excerpts[], prior_headings[], executed_queries[]}`, calls the model with the `record_round` tool schema, and prints the resulting `{sections[], gap_queries[]}` JSON to stdout. Orchestrator parses, dedups, snapshots citations, loops.
+- **Rationale:** Charges per-round LLM cost against the operator's Claude Pro/Max plan rather than `ANTHROPIC_API_KEY`. The orchestrator still owns budgets + dedup + citation snapshot in Python — only the LLM call moves to subprocess. Aligns with `[[anthropic_auth_split]]`: OAT/subscription for `claude -p`, API key reserved for course-gen and `/synthesize2`.
+- **Fallback:** If `CLAUDE_BIN` is missing or the subprocess fails (subscription exhausted, sandbox error), orchestrator records an error in the report's termination payload — it does NOT silently fall back to API-key SDK, since that would defeat the cost gate. Operator can flip `ASK_DEPTH_DEEP_BACKEND=api` env to force the SDK path for testing.
+- **Alternative:** Anthropic SDK only (current MVP). Rejected — the whole point of "take advantage of Claude usage" is to spend subscription tokens, not API-key tokens.
 
 ### Decision: Cost signal in PWA = static per-tier badge, not live estimate
 - **Choice:** Show "Standard — default", "Deep — minutes, ~$X-Y" labels. No dynamic estimate in v1.

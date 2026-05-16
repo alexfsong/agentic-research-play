@@ -20,7 +20,8 @@ PAYLOAD="$ARGUMENTS"
 RUN_ID=$(echo "$PAYLOAD" | jq -r '.run_id')
 QUESTION=$(echo "$PAYLOAD" | jq -r '.question')
 THREAD_ID=$(echo "$PAYLOAD" | jq -r '.thread_id // ""')
-MAX=$(echo "$PAYLOAD" | jq -r '.max_fetches // 10')
+DEPTH=$(echo "$PAYLOAD" | jq -r '.depth // "standard"')
+MAX=$(echo "$PAYLOAD" | jq -r '(.budget.max_fetches // .max_fetches) // 10')
 TOPIC=$(echo "$PAYLOAD" | jq -r '.topic // ""')
 URLS=$(echo "$PAYLOAD" | jq -r '.urls // [] | .[]')
 HISTORY=$(echo "$PAYLOAD" | jq -c '.history // []')   # JSON array of {q,a}, oldest→newest, may be empty
@@ -88,9 +89,14 @@ Retry 1s/2s/4s on 429/5xx, then bail that URL. Track per-URL outcomes in
 
 ### 5. Draft cited answer
 
-From the markdown bodies you fetched in step 3, draft a Markdown answer to
-`QUESTION`. The webhook stores this verbatim — what you write here is what
-the user sees in the PWA. No server-side LLM rewrite.
+**Skip this entire step if `DEPTH=deep`.** In deep mode the webhook
+orchestrator handles synthesis + report assembly; your job ends at corpus
+growth (steps 1-4). Proceed straight to the callback with empty `answer_md`
+and `citations`.
+
+For `DEPTH=standard` (default), from the markdown bodies you fetched in step 3,
+draft a Markdown answer to `QUESTION`. The webhook stores this verbatim — what
+you write here is what the user sees in the PWA. No server-side LLM rewrite.
 
 - **Continuation context**: if `HISTORY` is non-empty, treat it as the
   conversation so far. Resolve anaphora ("it", "that", "the same") against

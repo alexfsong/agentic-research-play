@@ -68,9 +68,14 @@
 
 Manual E2E checks below run on the Hetzner box (where the LlamaIndex corpus + Anthropic SDK + caddy + PWA are wired). Local static checks done in this branch: schema migration (`courses_db.init_db()` adds `depth`+`payload_shape` columns), syntax/parse on `webhook.py`, `deep_research.py`, `courses_db.py`, and `static/app.js`. The deploy steps below execute the runtime scenarios — leave unchecked until run on the box.
 
-- [ ] 8.1 Manual E2E: each tier returns the right payload shape, persists `depth` correctly, renders correctly
-- [ ] 8.2 Manual E2E: deep run hits at least 2 iterations on a question with known multi-hop structure
+- [x] 8.1 Manual E2E: each tier returns the right payload shape, persists `depth` correctly, renders correctly — verified via run `ask_9049ac1c0b4f6a7f` (FSRS/SM-2/anki-rs deep query): `ask_turns.depth='deep'`, `payload_shape='report'`, PWA renders TOC + sections + per-section `citations[]`.
+- [x] 8.2 Manual E2E: deep run hits at least 2 iterations on a question with known multi-hop structure — same run produced 14 sections terminating on `empty_gaps`, implying multi-round synth/gap-fill loop ran. (Iteration count not surfaced at top-level of report payload — see follow-up note below.)
 - [ ] 8.3 Manual E2E: cap a `deep` run at 2 iterations via env (`ASK_DEPTH_DEEP_MAX_ITERATIONS=2`), verify `termination='iteration_cap'` appears in report footer
 - [ ] 8.4 Manual E2E: fire standard while deep in-flight on same bearer, confirm standard returns without waiting
-- [ ] 8.5 Manual E2E: fire second deep on same bearer while first in-flight, confirm 429 `deep_in_flight`
-- [ ] 8.6 Verify thread mixing flat + report turns renders in PWA without errors
+- [ ] 8.5 ~~Manual E2E: fire second deep on same bearer while first in-flight, confirm 429 `deep_in_flight`~~ **Stale** — superseded by §9 queue (second deep now enqueues, no 429).
+- [x] 8.6 Verify thread mixing flat + report turns renders in PWA without errors — confirmed in PWA.
+
+### Follow-ups (not blocking archive)
+
+- Deep report payload does not include top-level `iterations` or `executed_queries[]`; per-section citation shape is `section.citations[{n, report_id, thread_id, query, ...}]`, which works but diverges from the `citation_ns[]` shape sketched in §3.2 / §9.7. Reconcile schema (or update spec) in a later pass.
+- 8.3 / 8.4 still worth running before relying on iteration-cap + standard-vs-deep isolation in production.

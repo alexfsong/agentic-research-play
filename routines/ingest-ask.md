@@ -35,6 +35,7 @@ below. If parsing fails, return a callback with `errors=[{"message":"text not JS
 - `topic` (string, optional) — free-form tag stored in metadata.
 - `depth` (string, optional, default `"standard"`) — tier selector. `standard` = full single-pass pipeline (search + fetch + ingest + draft answer + callback). `deep` = **search + fetch + ingest only**; the webhook orchestrates synthesis and the final report. Do not draft an answer when `depth=deep`.
 - `budget` (object, optional) — per-tier caps `{max_searches, max_fetches, max_tokens, max_iterations}`. Honor `max_fetches` if present (overrides the top-level `max_fetches` field). The other budgets are advisory for the routine; the orchestrator enforces iteration/token caps.
+- `parent_context` (object, optional) — present only when the user branched a thread from a prior turn. Shape: `{"question": "<parent turn question>", "answer_excerpt": "<truncated parent answer markdown>", "quote": "<verbatim selection — only on selection-level branches>", "carried_sources": [{"n": <int>, "title": "...", "url": "..."}, ...]}`. The first turn of a branched thread; `history` will be empty. See "Branched-thread prompt branch" below for handling.
 
 ## Environment
 - `WEBHOOK_URL`, `WEBHOOK_API_KEY`.
@@ -47,8 +48,9 @@ Read from routine secrets. Fail fast if missing.
 2. Validate. If `question` empty AND `urls` empty → POST callback with `errors=[{"message":"question or urls required"}]` and stop.
 3. Resolve the URL list:
    1. If `urls` non-empty → use verbatim (cap at `max_fetches`).
-   2. Else if `history` non-empty → reformulate `question` into a self-contained search query (resolve pronouns / "it" / "that" / "the same" against the prior turns), then `WebSearch <reformulated>`. Take the top `max_fetches` result URLs. Example: prior turn `q="What is FSRS?"`, current `question="how does it compare to SM-2?"` → search `"FSRS vs SM-2 spaced repetition algorithm"`.
-   3. Else → `WebSearch question` verbatim. Take the top `max_fetches` result URLs.
+   2. Else if `parent_context` present → reformulate `question` using the parent quote / question / answer excerpt as context (resolve "this", "that", "the same" against the parent), then `WebSearch <reformulated>`. Include any `parent_context.carried_sources[*].url` at the top of the URL list before web-search results (cap total at `max_fetches`) so citations can re-resolve them.
+   3. Else if `history` non-empty → reformulate `question` into a self-contained search query (resolve pronouns / "it" / "that" / "the same" against the prior turns), then `WebSearch <reformulated>`. Take the top `max_fetches` result URLs. Example: prior turn `q="What is FSRS?"`, current `question="how does it compare to SM-2?"` → search `"FSRS vs SM-2 spaced repetition algorithm"`.
+   4. Else → `WebSearch question` verbatim. Take the top `max_fetches` result URLs.
 4. For each URL:
    - Normalize: lowercase host, strip `#fragment`, remove `utm_*` / `fbclid` / `gclid` / `ref` query params.
    - `WebFetch` asking for Markdown. Extract document title from `<title>` or `<h1>`.
@@ -80,6 +82,31 @@ Read from routine secrets. Fail fast if missing.
 
 No `chunk_size` override.
 
+## Branched-thread prompt branch
+
+When `parent_context` is present (first turn of a branched thread), prepend
+the following preamble to the model context **before** the question, instead
+of (not in addition to) the regular history block — `history` will be empty
+for a branched first turn:
+
+```
+This question is a follow-up on prior context.
+Parent question: "<parent_context.question>"
+Parent answer excerpt: <parent_context.answer_excerpt>
+<if parent_context.quote>Highlighted passage from the parent answer: "<parent_context.quote>"</if>
+Carried sources from the parent turn (cite as needed; they will be re-fetched
+and ingested above): <list parent_context.carried_sources as "n. title — url">
+```
+
+Treat `parent_context.quote` (when present) as the focal hint: the user
+selected that span specifically. Steer the search + answer toward expanding
+on that passage rather than re-summarizing the parent answer wholesale.
+
+`parent_context.carried_sources` is a hint to ensure the URL list (step 3.2)
+re-fetches the same sources so per-section citations can map back to them
+in the new turn's `citations` array. Don't cite them by their parent index;
+the new `citations` array starts at `[1]` for this turn.
+
 ## Answer drafting
 
 After the fetch loop, before the callback, draft a Markdown answer to
@@ -91,6 +118,11 @@ verbatim — the webhook does no further LLM synthesis.
   prior turns. Don't repeat what was already said in `history[*].a` — pick up
   where it left off. Don't cite prior answers as sources; they're context, not
   evidence.
+- **Branched first turn**: when `parent_context` is present, the parent answer
+  is context (not evidence) and not part of `history`. Open by extending the
+  parent's framing (especially the highlighted `quote` if present) rather than
+  re-stating it. Cite only your own ingested sources — `carried_sources` are
+  hints for retrieval, not pre-resolved citations.
 - **Source set**: only the URLs you successfully fetched in this run (the
   `ingested` array). Don't cite skipped/errored URLs. Don't cite anything
   outside the fetched set (no model-prior facts, no remembered URLs, no prior

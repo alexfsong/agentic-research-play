@@ -25,7 +25,12 @@ MAX=$(echo "$PAYLOAD" | jq -r '(.budget.max_fetches // .max_fetches) // 10')
 TOPIC=$(echo "$PAYLOAD" | jq -r '.topic // ""')
 URLS=$(echo "$PAYLOAD" | jq -r '.urls // [] | .[]')
 HISTORY=$(echo "$PAYLOAD" | jq -c '.history // []')   # JSON array of {q,a}, oldest→newest, may be empty
+PARENT_CONTEXT=$(echo "$PAYLOAD" | jq -c '.parent_context // null')   # null OR {question, answer_excerpt, quote?, carried_sources[]}
 ```
+
+`parent_context` is non-null only on the first turn of a *branched* thread
+(see "Branched-thread prompt branch" below). When present, `HISTORY` will be
+empty.
 
 If JSON parse fails or `run_id` empty → POST callback with `errors=[{"message":"bad payload"}]` and stop.
 
@@ -45,6 +50,7 @@ If `QUESTION` empty AND `URLS` empty → POST callback with `errors=[{"message":
 ### 2. Resolve URLs
 
 - If `URLS` non-empty → use verbatim (cap at `MAX`).
+- Else if `PARENT_CONTEXT` non-null → reformulate `QUESTION` using the parent quote / question / answer excerpt as context (resolve "this", "that", "the same" against the parent). `WebSearch <reformulated>`. Then prepend any `parent_context.carried_sources[*].url` to the URL list (cap total at `MAX`) so citations can re-resolve them.
 - Else if `HISTORY` non-empty (length > 0) → reformulate `QUESTION` into a self-contained search query (resolve pronouns / "it" / "that" / "the same" against prior turns), then `WebSearch <reformulated>`. Take the top `MAX` result URLs. Example: prior `q="What is FSRS?"`, current `QUESTION="how does it compare to SM-2?"` → search `"FSRS vs SM-2 spaced repetition algorithm"`.
 - Else → `WebSearch QUESTION` verbatim. Take the top `MAX` result URLs.
 
@@ -87,6 +93,26 @@ Payload:
 Retry 1s/2s/4s on 429/5xx, then bail that URL. Track per-URL outcomes in
 `ingested`, `skipped`, `errors` arrays.
 
+### 4.5. Branched-thread prompt branch
+
+If `PARENT_CONTEXT` is non-null, prepend the following preamble to your model
+context **before** drafting the answer (replaces, doesn't supplement, the
+regular history block — `HISTORY` will be empty for a branched first turn):
+
+```
+This question is a follow-up on prior context.
+Parent question: "<parent_context.question>"
+Parent answer excerpt: <parent_context.answer_excerpt>
+[if parent_context.quote] Highlighted passage from the parent answer: "<parent_context.quote>"
+Carried sources from the parent turn (re-fetched and ingested above; cite as
+needed using *this turn's* citation indices, not the parent's):
+  <list parent_context.carried_sources as "n. title — url">
+```
+
+When `parent_context.quote` is present, that selection is the focal hint:
+steer the answer toward expanding on that passage rather than re-summarizing
+the parent.
+
 ### 5. Draft cited answer
 
 **Skip this entire step if `DEPTH=deep`.** In deep mode the webhook
@@ -103,6 +129,11 @@ you write here is what the user sees in the PWA. No server-side LLM rewrite.
   prior turns. Don't repeat what was already said in `HISTORY[*].a` — pick
   up where it left off. Prior answers are context, not evidence — don't
   cite them.
+- **Branched first turn**: when `PARENT_CONTEXT` is non-null, the parent
+  answer is context (not evidence) and `HISTORY` is empty. Open by extending
+  the parent's framing (especially the highlighted `quote` if present) rather
+  than re-stating it. Cite only sources you ingested in this run; the parent
+  `carried_sources` are retrieval hints, not pre-resolved citations.
 - **Source set**: only successfully-fetched URLs from this run (the
   `ingested` array). No skipped/errored URLs. No model-prior facts. No
   remembered URLs. No prior turns.
